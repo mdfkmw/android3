@@ -21,7 +21,7 @@ router.get('/route-order', async (req, res) => {
   }
 
   try {
-    const [rows] = await db.query(
+    const { rows } = await db.query(
       'SELECT route_id, position_idx FROM user_route_order WHERE user_id = ? ORDER BY position_idx ASC',
       [userId]
     );
@@ -82,8 +82,8 @@ router.get('/preferences', async (req, res) => {
   }
 
   try {
-    // pentru MariaDB: db.query() întoarce [rows]
-    const [rows] = await db.query(
+    // pentru MariaDB: db.query() întoarce { rows }
+    const { rows } = await db.query(
       'SELECT prefs_json FROM user_preferences WHERE user_id = ? LIMIT 1',
       [userId]
     );
@@ -186,8 +186,8 @@ router.get('/seatmap', async (req, res) => {
       return res.status(401).json({ error: 'User neautentificat' });
     }
 
-    const [rows] = await db.query(
-      `SELECT 
+    const { rows } = await db.query(
+      `SELECT
          narrow_text_size,
          narrow_text_color,
          wide_text_size,
