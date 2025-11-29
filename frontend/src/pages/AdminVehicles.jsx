@@ -85,6 +85,8 @@ export default function AdminVehicles() {
     // layout
     const [seats, setSeats] = useState([]);
     const [savingSeats, setSavingSeats] = useState(false);
+    const [copySourceId, setCopySourceId] = useState("");
+    const [copyingLayout, setCopyingLayout] = useState(false);
 
     // grilă
     const [extraRows, setExtraRows] = useState(0); // pentru „+ Rând jos”
@@ -204,7 +206,7 @@ export default function AdminVehicles() {
     };
     async function openEditor(id) {
         setSelectedId(id); setVehicle(null); setSeats([]); setExtraRows(0);
-        setExtraCols(0);
+        setExtraCols(0); setCopySourceId("");
         try {
             const r1 = await fetch(`/api/vehicles/${id}`); if (!r1.ok) throw new Error(`HTTP ${r1.status}`);
             const v = await r1.json(); setVehicle(v);
@@ -217,6 +219,34 @@ export default function AdminVehicles() {
             }));
             setSeats(withKeys);
         } catch (e) { console.error(e); setError("Nu am putut încărca editorul pentru această mașină."); }
+    }
+
+    async function copyLayoutFromOtherVehicle() {
+        if (!vehicle?.id) return;
+        if (!copySourceId) { alert("Selectează mașina sursă pentru copiere."); return; }
+        if (Number(copySourceId) === Number(vehicle.id)) { alert("Selectează altă mașină decât cea curentă."); return; }
+        setCopyingLayout(true); setError("");
+        try {
+            const r = await fetch(`/api/vehicles/${copySourceId}/seats`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const srcSeats = await r.json();
+            if (!Array.isArray(srcSeats) || srcSeats.length === 0) {
+                alert("Mașina selectată nu are locuri definite.");
+                return;
+            }
+            const now = Date.now();
+            const mapped = srcSeats.map((s, idx) => ({
+                ...s,
+                id: undefined,
+                vehicle_id: vehicle.id,
+                _delete: false,
+                _tmpId: `copy_${now}_${idx}_${Math.random().toString(36).slice(2, 7)}`
+            }));
+            setSeats(mapped);
+        } catch (e) {
+            console.error(e);
+            setError("Nu am putut copia layoutul de la mașina selectată.");
+        } finally { setCopyingLayout(false); }
     }
 
     async function saveVehicleDetails() {
@@ -563,7 +593,30 @@ export default function AdminVehicles() {
                     <div className="rounded-2xl border border-gray-200 p-4 shadow-sm bg-white">
                         <div className="flex items-center justify-between mb-3">
                             <h3 className="text-lg font-medium">Layout locuri</h3>
-                            <div className="flex gap-2">
+                            <div className="flex gap-2 flex-wrap justify-end">
+                                <div className="flex items-center gap-2">
+                                    <Select
+                                        value={copySourceId}
+                                        onChange={(e) => setCopySourceId(e.target.value)}
+                                        className="min-w-[220px]"
+                                    >
+                                        <option value="">Copiază layout de la…</option>
+                                        {vehicles
+                                            .filter(v => v.id !== vehicle?.id)
+                                            .map(v => (
+                                                <option key={v.id} value={v.id}>
+                                                    {v.name} ({v.plate_number})
+                                                </option>
+                                            ))}
+                                    </Select>
+                                    <button
+                                        onClick={copyLayoutFromOtherVehicle}
+                                        disabled={!copySourceId || copyingLayout}
+                                        className="rounded-xl bg-gray-100 px-3 py-2 hover:bg-gray-200 disabled:opacity-60"
+                                    >
+                                        {copyingLayout ? "Se copiază…" : "Copiază layout"}
+                                    </button>
+                                </div>
                                 <button onClick={()=>setExtraCols(c=>c+1)} className="rounded-xl bg-gray-100 px-3 py-2 hover:bg-gray-200">+ Coloană dreapta</button>
                                 <button onClick={() => setExtraRows(r => r + 1)} className="rounded-xl bg-gray-100 px-3 py-2 hover:bg-gray-200">+ Rând jos</button>
                                 <button onClick={addSeat} className="rounded-xl bg-gray-100 px-3 py-2 hover:bg-gray-200">+ Adaugă loc</button>
