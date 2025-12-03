@@ -242,7 +242,13 @@ export default function AdminVehicles() {
                 _delete: false,
                 _tmpId: `copy_${now}_${idx}_${Math.random().toString(36).slice(2, 7)}`
             }));
-            setSeats(mapped);
+
+            // marchează scaunele curente pentru ștergere astfel încât la salvare
+            // backend-ul să elimine vechiul layout, apoi aplică layoutul copiat
+            setSeats(prev => [
+                ...prev.filter(s => s.id).map(s => ({ ...s, _delete: true })),
+                ...mapped,
+            ]);
         } catch (e) {
             console.error(e);
             setError("Nu am putut copia layoutul de la mașina selectată.");
