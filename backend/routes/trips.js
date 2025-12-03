@@ -530,13 +530,16 @@ router.post('/autogenerate', async (req, res) => {
       curr.setDate(startDate.getDate() + d);
       const dateStr = curr.toISOString().slice(0, 10);
 
-      // 1️⃣ toate programele + flag should_disable
+      // 1️⃣ toate programele + flag should_disable + vizibilitate rute
       const { rows: schedules } = await db.query(
         `SELECT
            rs.id          AS schedule_id,
            rs.route_id,
            rs.departure,
            rs.operator_id,
+           r.visible_in_reservations,
+           r.visible_for_drivers,
+           r.visible_online,
            EXISTS(
              SELECT 1
                FROM schedule_exceptions se
@@ -548,17 +551,60 @@ router.post('/autogenerate', async (req, res) => {
                   OR se.weekday        = DAYOFWEEK(?)-1
                 )
            ) AS should_disable
-         FROM route_schedules rs`,
+         FROM route_schedules rs
+         JOIN routes r ON r.id = rs.route_id`,
         [dateStr, dateStr]
       );
 
-      // 2️⃣ pentru fiecare program – creează / sincronizează trip + vehicul
+
+      
+            // 2️⃣ pentru fiecare program – creează / sincronizează trip + vehicul
       for (const s of schedules) {
-        const defaultVehicleId = await resolveDefaultVehicleId(s.schedule_id, s.operator_id);
-        if (!defaultVehicleId) continue;
+        // Flag-urile de vizibilitate din routes (TINYINT → boolean)
+        const visibleInReservations = parseBooleanFlag(s.visible_in_reservations);
+        const visibleForDrivers     = parseBooleanFlag(s.visible_for_drivers);
+        const visibleOnline        = parseBooleanFlag(s.visible_online);
+
+        // Ruta este "cu rezervări" dacă:
+        // - apare în aplicația de agenți SAU
+        // - apare în site-ul public (online)
+        const hasReservations = visibleInReservations || visibleOnline;
+
+        // Dacă ruta nu e vizibilă nicăieri (nici agenți, nici online, nici șoferi),
+        // nu are rost să generăm trips pentru ea (rute complet dezactivate).
+        if (!visibleInReservations && !visibleForDrivers && !visibleOnline) {
+          continue;
+        }
+
+        // Rezolvăm vehiculul default DOAR pentru rutele cu rezervări (agenți sau online).
+        // Pentru rutele doar cu visible_for_drivers (curse scurte, fără rezervări),
+        // nu vrem să atașăm automat un vehicul la trip.
+        let defaultVehicleId = null;
+        if (hasReservations) {
+          defaultVehicleId = await resolveDefaultVehicleId(s.schedule_id, s.operator_id);
+
+          // Pentru rutele CU rezervări (indiferent dacă sunt doar online, doar la agenți sau ambele),
+          // este OBLIGATORIU să avem un vehicul default.
+          if (!defaultVehicleId) {
+            console.warn(
+              '[POST /api/trips/autogenerate] Nu există vehicul default pentru program cu rezervări',
+              {
+                scheduleId: s.schedule_id,
+                route_id: s.route_id,
+                date: dateStr,
+                time: s.departure,
+                visible_in_reservations: s.visible_in_reservations,
+                visible_online: s.visible_online,
+              }
+            );
+            continue;
+          }
+        }
+
 
         // cheie „logică”: route_schedule_id + date + time
         const disabled = s.should_disable ? 1 : 0;
+
         // NU crea al doilea trip la aceeași (schedule, date, time)
         const { rows: existsAny } = await db.query(
           `SELECT id FROM trips
@@ -568,61 +614,106 @@ router.post('/autogenerate', async (req, res) => {
              LIMIT 1`,
           [s.schedule_id, dateStr, s.departure]
         );
+
+        let tripId;
+
         if (existsAny.length) {
-          // există deja un trip la ora respectivă → skip INSERT
+          // există deja un trip la ora respectivă → lucrăm cu el în continuare
+          tripId = existsAny[0].id;
+        } else {
+          // Două apeluri /autogenerate pot rula în paralel.
+          // INSERT IGNORE ne protejează de duplicate.
+          const insRes = await db.query(
+            `INSERT IGNORE INTO trips
+               (route_schedule_id, route_id, date, time, disabled)
+             VALUES (?, ?, ?, ?, ?)`,
+            [s.schedule_id, s.route_id, dateStr, s.departure, disabled]
+          );
+          const affected = insRes.raw?.affectedRows ?? 0;
+          if (affected === 1) insertedTrips++;
+
+          // indiferent dacă INSERT a fost ignorat, ne asigurăm că avem tripId
+          if (!insRes.insertId) {
+            const { rows: trip } = await db.query(
+              `SELECT id FROM trips
+                 WHERE route_schedule_id = ?
+                   AND date = ?
+                   AND TIME(time) = TIME(?)
+                 LIMIT 1`,
+              [s.schedule_id, dateStr, s.departure]
+            );
+            if (!trip.length) {
+              console.warn(
+                '[POST /api/trips/autogenerate] Trip not found after insert',
+                {
+                  scheduleId: s.schedule_id,
+                  date: dateStr,
+                  time: s.departure
+                }
+              );
+              continue;
+            }
+            tripId = trip[0].id;
+          } else {
+            tripId = insRes.insertId;
+          }
+        }
+
+        // Dacă am ajuns aici și nu avem tripId din orice motiv, sărim peste.
+        if (!tripId) {
+          console.warn(
+            '[POST /api/trips/autogenerate] tripId lipsă după procesare',
+            {
+              scheduleId: s.schedule_id,
+              date: dateStr,
+              time: s.departure
+            }
+          );
           continue;
         }
-        // Două apeluri /autogenerate pot rula în paralel (manual sau prin CRON).
-        // Dacă am face doar INSERT simplu, am păstra fereastra "SELECT → INSERT"
-        // în care o altă instanță ar putea insersa același trip și am primi eroarea
-        // "duplicate entry" doar uneori. "INSERT IGNORE" închide cursa: dacă o
-        // altă instanță a inserat deja rândul, MySQL îl ignoră în liniște fără să
-        // perturbe asocierile de vehicule deja făcute.
-        const insRes = await db.query(
-          `INSERT IGNORE INTO trips
-             (route_schedule_id, route_id, date, time, disabled)
-           VALUES (?, ?, ?, ?, ?)`,
-          [s.schedule_id, s.route_id, dateStr, s.departure, disabled]
-        );
-        // affectedRows = 1 ⇒ INSERT efectuat, 0 ⇒ rând existent (ignorăm)
-        const affected = insRes.raw?.affectedRows ?? 0;
-        if (affected === 1) insertedTrips++;
 
-        let tripId = insRes.raw?.insertId;
-        if (!tripId) {
-          const { rows: trip } = await db.query(
-            `SELECT id FROM trips
-               WHERE route_schedule_id = ?
-                 AND date = ?
-                 AND TIME(time) = TIME(?)
-               LIMIT 1`,
-            [s.schedule_id, dateStr, s.departure]
+        // 2.1. Asociere vehicul default (trip_vehicles) DOAR dacă avem defaultVehicleId.
+        //
+        // Situații:
+        // - rute cu rezervări (hasReservations = true):
+        //     → am GARANTAT mai sus că defaultVehicleId nu e null
+        //     → deci aici vom atașa mașina.
+        //
+        // - rute fără rezervări, dar vizibile pentru șoferi (curse scurte):
+        //     → hasReservations = false
+        //     → defaultVehicleId poate fi null
+        //     → dacă E null, nu inserăm nimic în trip_vehicles,
+        //       iar mașina reală va fi setată de soferapp la pornirea cursei.
+        if (defaultVehicleId) {
+          // Dacă există DEJA orice vehicul asociat acestui trip,
+          // nu mai atașăm vehiculul implicit aici.
+          // Ideea: default-ul se aplică doar la tripuri "goale".
+          const { rows: existingTV } = await db.query(
+            `SELECT id FROM trip_vehicles
+              WHERE trip_id = ?
+              LIMIT 1`,
+            [tripId]
           );
 
-          if (!trip.length) {
-            console.warn(
-              '[POST /api/trips/autogenerate] Trip not found after insert',
-              {
-                scheduleId: s.schedule_id,
-                date: dateStr,
-                time: s.departure
-              }
-            );
+          if (existingTV.length) {
+            // există deja un vehicul (sau mai multe) pe acest trip,
+            // înseamnă că a fost setat manual (sau de soferapp),
+            // așa că nu mai modificăm nimic.
             continue;
           }
 
-          tripId = trip[0].id;
+          const tvRes = await db.query(
+            `INSERT INTO trip_vehicles (trip_id, vehicle_id, is_primary)
+             VALUES (?, ?, 1)
+             ON DUPLICATE KEY UPDATE is_primary = VALUES(is_primary)`,
+            [tripId, defaultVehicleId]
+          );
+          const tvAffected = tvRes.raw?.affectedRows ?? 0;
+          if (tvAffected === 1) insertedTV++; // 1 = insert, 2 = update
         }
-        // UPSERT atomic pentru trip_vehicles (cheie unică: trip_id + vehicle_id)
-        const tvRes = await db.query(
-          `INSERT INTO trip_vehicles (trip_id, vehicle_id, is_primary)
-           VALUES (?, ?, 1)
-           ON DUPLICATE KEY UPDATE is_primary = VALUES(is_primary)`,
-          [tripId, defaultVehicleId]
-        );
-        const tvAffected = tvRes.raw?.affectedRows ?? 0;
-        if (tvAffected === 1) insertedTV++; // 1 = insert, 2 = update
+
       }
+
     }
 
     res.json({

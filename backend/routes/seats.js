@@ -211,7 +211,8 @@ router.get('/', async (req, res) => {
              LIMIT 1
            ) AS payment_method
          FROM reservations r
-         JOIN people p ON p.id = r.person_id
+         LEFT JOIN people p ON p.id = r.person_id
+
         WHERE r.trip_id = ?
           AND r.status <> 'cancelled'
 `,
@@ -420,7 +421,8 @@ const { rows: reservations } = await db.query(`
       LIMIT 1
     ) AS payment_method
   FROM reservations r
-  JOIN people p ON p.id = r.person_id
+  LEFT JOIN people p ON p.id = r.person_id
+
   WHERE r.trip_id = ?
     AND r.status <> 'cancelled'
 `, [trip_id]);

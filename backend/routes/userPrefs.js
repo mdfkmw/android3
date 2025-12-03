@@ -147,8 +147,6 @@ router.put('/preferences', async (req, res) => {
   try {
     const serialized = JSON.stringify(json);
 
-    console.log('Salvez user_preferences pentru user', userId, 'prefs_json=', serialized);
-
     await db.query(
       `INSERT INTO user_preferences (user_id, prefs_json)
        VALUES (?, ?)
